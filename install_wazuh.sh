@@ -1,95 +1,91 @@
 #!/bin/bash
+#
+# install_wazuh.sh — Automated Wazuh installer (all-in-one or roles)
+#
 
-# Exit on any error
-set -e
+set -euo pipefail
 
-# Variables
-WAZUH_VERSION="4.13"
-NODE_NAME="wazuh-1"
-DASHBOARD_NODE_NAME="dashboard"
+WAZUH_VERSION="4.x"
+WAZUH_REPO_URL="https://packages.wazuh.com/${WAZUH_VERSION}/apt/"
+WAZUH_KEY_URL="https://packages.wazuh.com/key/GPG-KEY-WAZUH"
 
-# Update system
-echo "Updating system..."
-apt-get update && apt-get upgrade -y
+ROLE="${1:-all-in-one}"   # default role = all-in-one
+NODE_NAME="${2:-node01}"  # default node name = node01
+MASTER_IP="${3:-}"        # only used for cluster workers
 
-# Install required packages
-echo "Installing required packages..."
-apt-get install -y gnupg apt-transport-https curl debhelper tar libcap2-bin
+echo "[*] Starting Wazuh install (role=$ROLE, node_name=$NODE_NAME)"
 
-# Add Wazuh GPG key and repository
-echo "Adding Wazuh GPG key and repository..."
-curl -s https://packages.wazuh.com/key/GPG-KEY-WAZUH | gpg --no-default-keyring --keyring /usr/share/keyrings/wazuh.gpg --import
-echo "deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/${WAZUH_VERSION}/apt/ stable main" | tee /etc/apt/sources.list.d/wazuh.list
+# -------------------------------
+# STEP 1: Fix old repo conflicts
+# -------------------------------
+echo "[*] Cleaning old Wazuh repo entries..."
+rm -f /etc/apt/sources.list.d/wazuh.list || true
+rm -f /etc/apt/sources.list.d/wazuh.repo || true
 
-# Update package list
-apt-get update
+# -------------------------------
+# STEP 2: Install prereqs & add repo
+# -------------------------------
+echo "[*] Installing prerequisites..."
+apt-get update -y
+apt-get install -y gnupg apt-transport-https curl tar
 
-# Install Wazuh manager
-echo "Installing Wazuh manager..."
-apt-get install -y wazuh-manager
+echo "[*] Adding Wazuh GPG key..."
+curl -s "$WAZUH_KEY_URL" | gpg --dearmor > /usr/share/keyrings/wazuh.gpg
+chmod 644 /usr/share/keyrings/wazuh.gpg
 
-# Install Filebeat
-echo "Installing Filebeat..."
-apt-get install -y filebeat
+echo "[*] Adding Wazuh repository..."
+echo "deb [signed-by=/usr/share/keyrings/wazuh.gpg] $WAZUH_REPO_URL stable main" | tee /etc/apt/sources.list.d/wazuh.list
+apt-get update -y
 
-# Configure Filebeat to forward logs to Wazuh indexer
-echo "Configuring Filebeat..."
-cat <<EOF > /etc/filebeat/filebeat.yml
-filebeat.inputs:
-  - type: log
-    paths:
-      - /var/log/*.log
+# -------------------------------
+# STEP 3: All-in-one install
+# -------------------------------
+if [[ "$ROLE" == "all-in-one" ]]; then
+    echo "[*] Downloading official Wazuh installer..."
+    rm -f wazuh-install.sh
+    curl -L -o wazuh-install.sh https://packages.wazuh.com/${WAZUH_VERSION}/wazuh-install.sh
 
-output.elasticsearch:
-  hosts: ["https://127.0.0.1:9200"]
-  username: "admin"
-  password: "admin"
-  ssl.certificate_authorities: ["/etc/wazuh-manager/certs/root-ca.pem"]
-  ssl.certificate: "/etc/wazuh-manager/certs/admin.pem"
-  ssl.key: "/etc/wazuh-manager/certs/admin-key.pem"
-EOF
+    echo "[*] Checking installer header..."
+    head -n 1 wazuh-install.sh | grep -q "#!" || { echo "[!] ERROR: installer corrupted"; exit 1; }
 
-# Enable and start Filebeat
-systemctl enable filebeat
-systemctl start filebeat
+    chmod +x wazuh-install.sh
+    echo "[*] Running Wazuh all-in-one installer..."
+    ./wazuh-install.sh --all-in-one "$NODE_NAME"
 
-# Install Wazuh indexer
-echo "Installing Wazuh indexer..."
-apt-get install -y wazuh-indexer
+    echo "[✅] All-in-one Wazuh installation finished!"
+    exit 0
+fi
 
-# Configure Wazuh indexer
-echo "Configuring Wazuh indexer..."
-cat <<EOF > /etc/wazuh-indexer/opensearch.yml
-network.host: 0.0.0.0
-node.name: ${NODE_NAME}
-cluster.initial_master_nodes: ["${NODE_NAME}"]
-discovery.seed_hosts: ["127.0.0.1"]
-plugins.security.nodes_dn:
-  - "CN=${NODE_NAME},OU=Wazuh,O=Wazuh,L=California,C=US"
-EOF
+# -------------------------------
+# STEP 4: Role-based installs
+# -------------------------------
+if [[ "$ROLE" == "server" ]]; then
+    apt-get install -y wazuh-manager filebeat
+    echo "[✅] Installed Wazuh server + Filebeat. Configure certs + filebeat.yml manually."
+    exit 0
+fi
 
-# Start Wazuh indexer
-systemctl enable wazuh-indexer
-systemctl start wazuh-indexer
+if [[ "$ROLE" == "dashboard" ]]; then
+    apt-get install -y wazuh-dashboard
+    echo "[✅] Installed Wazuh dashboard. Configure /usr/share/wazuh-dashboard/data/wazuh/config/wazuh.yml."
+    exit 0
+fi
 
-# Install Wazuh dashboard
-echo "Installing Wazuh dashboard..."
-apt-get install -y wazuh-dashboard
+if [[ "$ROLE" == "indexer" ]]; then
+    apt-get install -y wazuh-indexer
+    echo "[✅] Installed Wazuh indexer. Configure cluster.yml manually."
+    exit 0
+fi
 
-# Configure Wazuh dashboard
-echo "Configuring Wazuh dashboard..."
-cat <<EOF > /etc/wazuh-dashboard/opensearch_dashboards.yml
-server.host: "0.0.0.0"
-server.port: 443
-opensearch.hosts: ["https://127.0.0.1:9200"]
-ssl.certificate: "/etc/wazuh-dashboard/certs/dashboard.pem"
-ssl.key: "/etc/wazuh-dashboard/certs/dashboard-key.pem"
-EOF
+if [[ "$ROLE" == "cluster-server" ]]; then
+    if [[ -z "$MASTER_IP" ]]; then
+        echo "Usage: $0 cluster-server <node_name> <master_ip>"
+        exit 1
+    fi
+    apt-get install -y wazuh-manager filebeat
+    echo "[✅] Installed cluster worker node ($NODE_NAME). Configure ossec.conf with master IP: $MASTER_IP."
+    exit 0
+fi
 
-# Enable and start Wazuh dashboard
-systemctl enable wazuh-dashboard
-systemctl start wazuh-dashboard
-
-# Output installation summary
-echo "Wazuh installation completed successfully!"
-echo "You can access the Wazuh dashboard at https://<YOUR_SERVER_IP>"
+echo "[!] Unknown role: $ROLE"
+exit 1
